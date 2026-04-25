@@ -1,0 +1,451 @@
+# ============================================================
+#   INTELLIGENT MEDICAL ASSISTANT — Google Colab
+#   Batch mode: processes all images in test_images/
+#   CSV columns: active_ingredient | interactions_to_avoid
+# ============================================================
+
+
+# ============================================================
+# STEP 1 — INSTALL LIBRARIES
+# ============================================================
+
+!pip install -q easyocr
+!pip install -q tensorflow
+!pip install -q pandas
+!pip install -q opencv-python
+!pip install -q matplotlib
+!pip install -q tqdm
+
+
+# ============================================================
+# STEP 2 — IMPORTS
+# ============================================================
+
+import os
+import re
+import warnings
+
+import cv2
+import easyocr
+import matplotlib.pyplot as plt
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras.applications import MobileNetV2
+from tensorflow.keras.applications.mobilenet_v2 import preprocess_input, decode_predictions
+from tensorflow.keras.preprocessing import image as keras_image
+from tqdm import tqdm
+from google.colab import drive
+
+warnings.filterwarnings("ignore")
+print("✅ Libraries ready.")
+
+
+# ============================================================
+# STEP 3 — MOUNT GOOGLE DRIVE
+# ============================================================
+
+drive.mount("/content/drive")
+print("✅ Google Drive mounted.")
+
+
+# ============================================================
+# STEP 4 — CONFIGURATION  ← only edit this section
+# ============================================================
+
+# Folder containing 150 images
+IMAGE_FOLDER = "/content/drive/MyDrive/AI_Project/test_images"
+
+# CSV database (columns: active_ingredient, interactions_to_avoid)
+DATABASE_PATH = "/content/drive/MyDrive/AI_Project/meds_database.csv"
+
+# Where the final report CSV will be saved
+OUTPUT_REPORT = "/content/drive/MyDrive/AI_Project/batch_report.csv"
+
+# Languages for OCR  ('pl' = Polish, 'en' = English)
+OCR_LANGUAGES = ["pl", "en"]
+
+# MobileNetV2 confidence threshold (5% — permissive for prototype)
+TF_THRESHOLD = 0.05
+
+# ImageNet labels that match blister packs, pills, bottles, packages
+MEDICINE_LABELS = [
+    "pill",
+    "bottle",
+    "packet",
+    "container",
+    "carton",
+    "box",
+    "label",
+    "envelope",
+    "cap",
+    "vial",
+]
+
+# Set to a small number (e.g. 5) to do a quick test run first.
+# Change to None to process all 150 images.
+MAX_IMAGES = None
+
+# Show a matplotlib preview every N images (0 = never, saves time)
+PREVIEW_EVERY_N = 50
+
+print("✅ Configuration loaded.")
+
+
+# ============================================================
+# STEP 5 — LOAD DATABASE
+# ============================================================
+
+def load_database(path):
+    """
+    Load the CSV medication database and normalise the
+    active_ingredient column to lowercase for matching.
+    Returns a pandas DataFrame or None if loading fails.
+    """
+    print(f"\n📂 Loading database: {path}")
+    try:
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"File not found: {path}")
+
+        df = pd.read_csv(path)
+
+        # Check the two required columns exist
+        required = {"active_ingredient", "interactions_to_avoid"}
+        missing  = required - set(df.columns)
+        if missing:
+            raise ValueError(f"CSV is missing columns: {missing}  |  Found: {list(df.columns)}")
+
+        # Normalise to lowercase so matching is case-insensitive
+        df["active_ingredient"] = df["active_ingredient"].str.lower().str.strip()
+
+        print(f"✅ Database loaded — {len(df)} records.")
+        return df
+
+    except FileNotFoundError as e:
+        print(f"❌ FILE ERROR: {e}")
+        return None
+    except ValueError as e:
+        print(f"❌ DATA ERROR: {e}")
+        return None
+    except Exception as e:
+        print(f"❌ UNEXPECTED ERROR: {e}")
+        return None
+
+
+# ============================================================
+# STEP 6 — COLLECT IMAGE PATHS
+# ============================================================
+
+def collect_images(folder):
+    """
+    Scan the folder and return a sorted list of image paths.
+    Accepts .jpg, .jpeg, .png, .bmp files only.
+    """
+    VALID = {".jpg", ".jpeg", ".png", ".bmp"}
+
+    if not os.path.isdir(folder):
+        raise NotADirectoryError(
+            f"Folder not found: '{folder}'\n"
+            "Check IMAGE_FOLDER in STEP 4."
+        )
+
+    paths = sorted([
+        os.path.join(folder, f)
+        for f in os.listdir(folder)
+        if os.path.splitext(f)[1].lower() in VALID
+    ])
+
+    print(f"📁 Found {len(paths)} image(s) in '{folder}'.")
+    return paths
+
+
+# ============================================================
+# STEP 7 — LOAD ONE IMAGE
+# ============================================================
+
+def load_image(path):
+    """
+    Read an image with OpenCV and convert BGR → RGB.
+    Returns a NumPy array or None if the file is unreadable.
+    """
+    try:
+        img_bgr = cv2.imread(path)
+        if img_bgr is None:
+            raise ValueError("OpenCV could not decode the file.")
+        return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+    except Exception:
+        return None
+
+
+# ============================================================
+# STEP 8 — PHASE 1: TENSORFLOW FILTER
+# ============================================================
+
+def phase1_tf_filter(img_rgb, model):
+    """
+    HOW IT WORKS
+    ─────────────
+    1. Resize image to 224×224 px (MobileNetV2's required input size).
+    2. Add batch dimension: (224,224,3) → (1,224,224,3).
+    3. Scale pixels from [0,255] to [-1,1] with preprocess_input().
+    4. Run model.predict() to get 1,000 class confidence scores.
+    5. decode_predictions() maps scores to human-readable ImageNet labels.
+    6. If any top-5 label contains a medicine keyword → PASS.
+    """
+    try:
+        img_resized  = cv2.resize(img_rgb, (224, 224))
+        img_array    = keras_image.img_to_array(img_resized)
+        img_batch    = np.expand_dims(img_array, axis=0)   # shape: (1,224,224,3)
+        img_prepared = preprocess_input(img_batch)          # scale to [-1, 1]
+
+        preds  = model.predict(img_prepared, verbose=0)
+        top5   = [(lbl, float(sc)) for (_, lbl, sc) in decode_predictions(preds, top=5)[0]]
+
+        for label, score in top5:
+            for keyword in MEDICINE_LABELS:
+                if keyword in label.lower().replace("_", " ") and score >= TF_THRESHOLD:
+                    return True, top5
+
+        return False, top5
+
+    except Exception as e:
+        return False, []
+
+
+# ============================================================
+# STEP 9 — PHASE 2: EASYOCR TEXT EXTRACTION
+# ============================================================
+
+def phase2_ocr(img_rgb, reader):
+    """
+    HOW IT WORKS
+    ─────────────
+    EasyOCR uses two deep-learning stages:
+    1. DETECTOR   — finds where text is (bounding boxes).
+    2. RECOGNISER — reads characters inside each bounding box.
+
+    After extraction the text is cleaned:
+    • Converted to lowercase
+    • Special characters removed (Polish letters kept)
+    • Multiple spaces collapsed into one
+
+    Returns a cleaned string or None if no text was found.
+    """
+    try:
+        results = reader.readtext(img_rgb, detail=1)
+        if not results:
+            return None
+
+        raw     = " ".join([text for (_, text, _) in results])
+        cleaned = raw.lower()
+        cleaned = re.sub(r"[^a-ząćęłńóśźż0-9\s]", " ", cleaned)
+        cleaned = re.sub(r"\s+", " ", cleaned).strip()
+
+        return cleaned if cleaned else None
+
+    except Exception:
+        return None
+
+
+# ============================================================
+# STEP 10 — PHASE 3: DATABASE MATCHING
+# ============================================================
+
+def phase3_match(cleaned_text, df):
+    """
+    Check whether any active ingredient from the database
+    appears as a substring inside the cleaned OCR text.
+
+    Example: OCR text = "ibuprofen 400 mg tablets"
+             Database = "ibuprofen"  → MATCH ✅
+
+    Returns a filtered DataFrame with matching rows, or None.
+    """
+    try:
+        matched = df[df["active_ingredient"].apply(lambda ing: ing in cleaned_text)]
+        return matched if not matched.empty else None
+    except Exception:
+        return None
+
+
+# ============================================================
+# STEP 11 — OPTIONAL MATPLOTLIB PREVIEW
+# ============================================================
+
+def show_preview(img_rgb, filename, color, caption):
+    """Display an image inline in Colab with a coloured border."""
+    fig, ax = plt.subplots(figsize=(5, 4))
+    ax.imshow(img_rgb)
+    ax.axis("off")
+    ax.set_title(f"{filename}\n{caption}", fontsize=9, color=color, fontweight="bold")
+
+    rect = plt.Rectangle(
+        (0.01, 0.01), 0.98, 0.97,
+        linewidth=6, edgecolor=color, facecolor="none",
+        transform=fig.transFigure, clip_on=False
+    )
+    fig.add_artist(rect)
+    plt.tight_layout()
+    plt.show()
+    plt.close()
+
+
+# ============================================================
+# STEP 12 — MAIN BATCH PIPELINE
+# ============================================================
+
+def run_pipeline():
+
+    print("\n" + "="*55)
+    print("  🏥 MEDICAL ASSISTANT — Batch Pipeline Starting")
+    print("="*55)
+
+    # ── Load database ─────────────────────────────────────────
+    db = load_database(DATABASE_PATH)
+    if db is None:
+        print("🛑 Aborted: fix the database error above and try again.")
+        return
+
+    # ── Collect image paths ───────────────────────────────────
+    try:
+        all_paths = collect_images(IMAGE_FOLDER)
+    except NotADirectoryError as e:
+        print(f"🛑 Aborted: {e}")
+        return
+
+    if not all_paths:
+        print("🛑 Aborted: no valid image files found in the folder.")
+        return
+
+    # Apply optional cap for test runs
+    if MAX_IMAGES is not None:
+        all_paths = all_paths[:MAX_IMAGES]
+        print(f"⚠️  Test mode: processing first {MAX_IMAGES} of {len(all_paths)} images.")
+
+    total = len(all_paths)
+
+    # ── Load TensorFlow model ONCE ────────────────────────────
+    # Loading inside the loop would waste ~5 sec × 500 = 40 minutes.
+    print("\n⏳ Loading MobileNetV2 (once, before the loop) …")
+    tf_model = MobileNetV2(weights="imagenet", include_top=True)
+    print("✅ MobileNetV2 ready.")
+
+    # ── Load EasyOCR reader ONCE ──────────────────────────────
+    print(f"\n⏳ Loading EasyOCR for {OCR_LANGUAGES} (once, before the loop) …")
+    ocr_reader = easyocr.Reader(OCR_LANGUAGES, gpu=False)
+    print("✅ EasyOCR ready.")
+
+    # ── Results list — one dict per image ─────────────────────
+    log = []
+
+    # Counters
+    n_rejected    = 0
+    n_no_text     = 0
+    n_clean       = 0
+    n_interaction = 0
+
+    print(f"\n🔄 Processing {total} images …\n")
+
+    for idx, img_path in enumerate(tqdm(all_paths, desc="Progress", unit="img")):
+
+        filename = os.path.basename(img_path)
+
+        # Default record for this image
+        record = {
+            "filename"             : filename,
+            "tf_passed"            : False,
+            "detected_text"        : "",
+            "matched_ingredients"  : "",
+            "interactions_to_avoid": "",
+            "status"               : "",
+        }
+
+        # ── Load image ────────────────────────────────────────
+        img_rgb = load_image(img_path)
+        if img_rgb is None:
+            record["status"] = "ERROR: could not load image"
+            log.append(record)
+            continue
+
+        # ── Phase 1: TensorFlow filter ────────────────────────
+        passed, top5 = phase1_tf_filter(img_rgb, tf_model)
+        record["tf_passed"] = passed
+
+        if not passed:
+            record["status"] = "REJECTED by TF filter"
+            n_rejected += 1
+            color   = "red"
+            caption = "❌ Not recognised as medicine"
+
+        else:
+            # ── Phase 2: OCR ──────────────────────────────────
+            cleaned_text = phase2_ocr(img_rgb, ocr_reader)
+            record["detected_text"] = cleaned_text or ""
+
+            if not cleaned_text:
+                record["status"] = "NO TEXT detected"
+                n_no_text += 1
+                color   = "orange"
+                caption = "⚠️ No text found"
+
+            else:
+                # ── Phase 3: Database match ────────────────────
+                matches = phase3_match(cleaned_text, db)
+
+                if matches is not None:
+                    record["matched_ingredients"]    = " | ".join(matches["active_ingredient"].tolist())
+                    record["interactions_to_avoid"]  = " | ".join(matches["interactions_to_avoid"].tolist())
+                    record["status"] = "⚠️ INTERACTION FOUND"
+                    n_interaction += 1
+                    color   = "green"
+                    caption = f"⚠️ {record['matched_ingredients']}"
+                else:
+                    record["status"] = "✅ No interaction found"
+                    n_clean += 1
+                    color   = "orange"
+                    caption = "✅ No interactions"
+
+        log.append(record)
+
+        # Optional inline preview
+        if PREVIEW_EVERY_N > 0 and (idx + 1) % PREVIEW_EVERY_N == 0:
+            show_preview(img_rgb, filename, color, caption)
+
+    # ── Save report CSV ───────────────────────────────────────
+    report = pd.DataFrame(log)
+    report.to_csv(OUTPUT_REPORT, index=False, encoding="utf-8-sig")
+    # utf-8-sig encoding ensures Polish characters display correctly in Excel
+
+    # ── Final summary ─────────────────────────────────────────
+    print("\n" + "="*55)
+    print("  📋 BATCH COMPLETE — SUMMARY")
+    print("="*55)
+    print(f"  Total processed          : {total}")
+    print(f"  ❌ Rejected by TF filter : {n_rejected}")
+    print(f"  ⚠️  No text detected     : {n_no_text}")
+    print(f"  ✅ No interaction found  : {n_clean}")
+    print(f"  🚨 INTERACTIONS FOUND    : {n_interaction}  ← review these!")
+    print("="*55)
+    print(f"\n💾 Report saved to:\n   {OUTPUT_REPORT}")
+
+    # Print a list of flagged images
+    if n_interaction > 0:
+        print("\n🚨 Flagged images (interactions detected):")
+        flagged = report[report["status"] == "⚠️ INTERACTION FOUND"]
+        for _, row in flagged.iterrows():
+            print(f"   • {row['filename']}")
+            print(f"     Ingredient   : {row['matched_ingredients']}")
+            print(f"     Interactions : {row['interactions_to_avoid']}")
+
+    print("\n🏁 Pipeline finished.")
+    return report
+
+
+# ============================================================
+# STEP 13 — RUN
+# ============================================================
+
+final_report = run_pipeline()
+
+# Uncomment the line below to display the full report table in Colab:
+# final_report
